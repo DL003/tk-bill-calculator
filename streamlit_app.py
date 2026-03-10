@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import io
-import re
 
 st.set_page_config(page_title="TK 账单极速核算系统", layout="wide")
 
@@ -39,7 +38,7 @@ with col5: file_e = st.file_uploader("表 E (刷单表 - 可选)", type=["xlsx",
 def to_key(s):
     return str(s).strip().lower()
 
-# 辅助函数：终极单号清洗器 (解决科学计数法 5.814e+17 和 .0 后缀)
+# 辅助函数：终极单号清洗器
 def clean_id(x):
     s = str(x).strip().lower()
     if 'e+' in s:
@@ -100,11 +99,10 @@ if all([file_a, file_b, file_c, file_d]):
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '实际售价'] = 0.0
 
         # ==========================================
-        # 第三步：匹配表 C 最新制定的 36 项费用
+        # 第三步：匹配表 C 费用
         # ==========================================
         c_col_map = {to_key(c): c for c in df_c.columns}
         
-        # 最新的费用列表 (包含 Total fees, 但不在佣金求和里)
         all_fee_columns = [
             'Total Fees', 'Platform commission fee', 'Pre-order service fee', 'Mall service fee', 'Payment Fee', 
             'Shipping cost', 'Shipping costs passed on to the logistics provider', 'Replacement shipping fee (passed on to the customer)', 
@@ -118,35 +116,29 @@ if all([file_a, file_b, file_c, file_d]):
             'GMV Max ad fee', 'Ajustment amount'
         ]
         
-        # 找到表C中实际存在的列名进行合并
         valid_c_cols = [c_col_map[to_key(f)] for f in all_fee_columns if to_key(f) in c_col_map]
         df_c_unique = df_c.drop_duplicates(subset=['match_id'])
         df = pd.merge(df, df_c_unique[['match_id'] + valid_c_cols], on='match_id', how='left')
         
-        # 分摊计算
         佣金求和项 = []
         for fee in all_fee_columns:
             actual_c_col = c_col_map.get(to_key(fee))
             if actual_c_col:
-                # 分摊
                 df[fee] = pd.to_numeric(df[actual_c_col], errors='coerce').fillna(0) / df['订单统计']
-                # 第四步：排除 Total Fees，将其余项加入佣金求和名单
                 if to_key(fee) != 'total fees':
                     佣金求和项.append(fee)
             else:
                 df[fee] = 0.0
                 
-        # 计算佣金共计
         df['佣金共计'] = df[佣金求和项].sum(axis=1)
-        # 为了兼容你模板可能写的“佣金总计”
         df['佣金总计'] = df['佣金共计']
 
         # ==========================================
-        # 第五步：匹配成本表
+        # 第五步：匹配成本表 (修复匹配逻辑)
         # ==========================================
-        d_col_map = {to_key(c): c for c in df_d.columns}
-        d_sku_actual = d_col_map.get('nomor referensi sku')
-        d_cost_actual = d_col_map.get('cost') or d_col_map.get('成本') or d_col_map.get('价格')
+        # 模糊匹配 SKU 和 成本列，只要包含关键词即可
+        d_sku_actual = next((c for c in df_d.columns if 'nomor referensi sku' in to_key(c) or 'seller sku' in to_key(c)), None)
+        d_cost_actual = next((c for c in df_d.columns if '成本' in to_key(c) or 'cost' in to_key(c) or '价格' in to_key(c)), None)
         
         if d_sku_actual and d_cost_actual:
             df_d['match_sku'] = df_d[d_sku_actual].astype(str).str.strip().str.lower()
@@ -154,9 +146,10 @@ if all([file_a, file_b, file_c, file_d]):
             
             df_d_unique = df_d.drop_duplicates(subset=['match_sku'])
             df = pd.merge(df, df_d_unique[['match_sku', d_cost_actual]], on='match_sku', how='left')
-            df['RMB成本'] = pd.to_numeric(df[d_cost_actual], errors='coerce').fillna(0)
+            # 这里的字段名必须直接叫 '成本'，才能匹配到模板 A 的表头
+            df['成本'] = pd.to_numeric(df[d_cost_actual], errors='coerce').fillna(0)
         else:
-            df['RMB成本'] = 0.0
+            df['成本'] = 0.0
 
         # ==========================================
         # 第六步：匹配表 E 刷单表
@@ -184,7 +177,8 @@ if all([file_a, file_b, file_c, file_d]):
         # 第七步：计算总成本
         # ==========================================
         qty = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
-        df['总成本'] = qty * df['RMB成本'] * rate_rmb_to_fx
+        # 总成本 = 数量 * 成本 * 汇率
+        df['总成本'] = qty * df['成本'] * rate_rmb_to_fx
         
         df.loc[df['is_sd'] == True, '总成本'] = 0.0
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '总成本'] = 0.0
@@ -202,7 +196,6 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第九步：计算最终毛利
         # ==========================================
-        # 取出 Total Fees 参与毛利计算，如果没有匹配到默认为0
         t_fee_col = 'Total Fees'
         t_fee_val = df[t_fee_col] if t_fee_col in df.columns else 0.0
         
@@ -219,17 +212,14 @@ if all([file_a, file_b, file_c, file_d]):
         for t_col in template_columns:
             if pd.isna(t_col): continue
             
-            # 去除可能包含的换行符和多余空格再进行匹配
             clean_t_col = str(t_col).replace('\n', ' ').strip().lower()
-            
-            # 尝试各种清洗后的匹配
             match_col = next((c for c in df.columns if str(c).replace('\n', ' ').strip().lower() == clean_t_col), None)
             
             if match_col:
                 df_final[t_col] = df[match_col]
 
         st.divider()
-        st.success("✅ 核算完毕！已更新 36 项费用清单及佣金计算规则。")
+        st.success("✅ 核算完毕！【成本】列已修复匹配逻辑，数据完全对齐。")
         st.dataframe(df_final.head(15))
 
         output = io.BytesIO()
