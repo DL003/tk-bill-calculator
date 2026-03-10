@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="TK 账单助手-终极拼接版", layout="wide")
+st.set_page_config(page_title="TK 账单助手-空值免疫版", layout="wide")
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -16,7 +16,7 @@ st.header("2. 数据上传")
 col_a, col_b, col_c = st.columns(3)
 col_d, col_e, _ = st.columns(3)
 
-with col_a: file_a = st.file_uploader("上传【表 A 模板】(双行表头)", type=["xlsx", "csv"])
+with col_a: file_a = st.file_uploader("上传【表 A 模板】", type=["xlsx", "csv"])
 with col_b: file_b = st.file_uploader("上传【表 B】(销售表)", type=["xlsx", "csv"])
 with col_c: file_c = st.file_uploader("上传【表 C】(收入表)", type=["xlsx", "csv"])
 with col_d: file_d = st.file_uploader("上传【表 D】(成本表)", type=["xlsx", "csv"])
@@ -24,7 +24,7 @@ with col_e: file_e = st.file_uploader("上传【表 E】(刷单-可选)", type=[
 
 def find_col_regex(columns, pattern):
     for col in columns:
-        if re.search(pattern, str(col), re.IGNORECASE):
+        if pd.notna(col) and re.search(pattern, str(col), re.IGNORECASE):
             return col
     return None
 
@@ -66,12 +66,14 @@ if all([file_a, file_b, file_c, file_d]):
         df_b[b_sku_col] = df_b[b_sku_col].astype(str).str.strip()
         df_d[d_sku_col] = df_d[d_sku_col].astype(str).str.strip()
 
-        # 4. 费项映射
+        # 4. 费项映射 (强制字符串转换防范空表头 NaN 报错)
         fee_mapping = {}
         for c_col in df_c.columns:
             clean_c = re.sub(r'\(.*?\)', '', str(c_col)).strip().lower()
             for t_key in template_keys:
-                if str(t_key).strip().lower() == clean_c or str(t_key).strip().lower() == str(c_col).lower():
+                if pd.isna(t_key): continue # 忽略空表头
+                t_str = str(t_key).strip().lower()
+                if t_str == clean_c or t_str == str(c_col).lower():
                     fee_mapping[c_col] = t_key
 
         # 5. 合并与计算
@@ -80,10 +82,11 @@ if all([file_a, file_b, file_c, file_d]):
         common_fees = [c for c in fee_mapping.keys() if c != c_order_col]
         df = pd.merge(df_b, df_c[[c_order_col] + common_fees], left_on=b_order_col, right_on=c_order_col, how='left')
 
-        # 分摊费用 (强制转换为数字以防报错)
+        # 分摊费用
         for c_col in common_fees:
             t_key = fee_mapping[c_col]
-            if t_key.lower() not in ['order number', 'order id']:
+            # 【修复点】强制转为 str 后再 lower()，防止 float 对象报错
+            if str(t_key).lower() not in ['order number', 'order id']:
                 numeric_vals = pd.to_numeric(df[c_col], errors='coerce').fillna(0)
                 df[t_key] = numeric_vals / df['订单统计']
 
@@ -116,10 +119,13 @@ if all([file_a, file_b, file_c, file_d]):
         
         df['刷单佣金'] = df['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
 
-        # 成本与毛利计算
+        # 【修复点】矢量化成本与毛利计算，避免 apply 和索引错误
         qty_numeric = pd.to_numeric(df[b_qty_col], errors='coerce').fillna(0)
         cost_numeric = pd.to_numeric(df[d_cost_col], errors='coerce').fillna(0)
-        df['总成本'] = df.apply(lambda x: (x.name, qty_numeric[x.name] * cost_numeric[x.name] * rate_rmb_to_fx)[1] if not df['is_sd'][x.name] else 0, axis=1)
+        
+        df['总成本'] = qty_numeric * cost_numeric * rate_rmb_to_fx
+        # 若是刷单，成本设为0
+        df.loc[df['is_sd'] == True, '总成本'] = 0.0
 
         valid_mask = df[b_status_col].astype(str).str.lower() != 'canceled'
         total_sales = df.loc[valid_mask, '实际售价'].sum()
@@ -133,9 +139,14 @@ if all([file_a, file_b, file_c, file_d]):
             fee_vals = pd.to_numeric(df[c_total_fee_col], errors='coerce').fillna(0)
             df.loc[valid_mask, '毛利'] = df['实际售价'] + (fee_vals/df['订单统计']) - df['总成本'] - df['广告'] - df['刷单费用'] - df['刷单佣金']
 
-        # 6. 【核心修复】列拼接构建最终表，杜绝索引错误
+        # 6. 列拼接构建最终表
         out_cols = []
         for t_key in template_keys:
+            if pd.isna(t_key):
+                # 遇到空白列，填充空数据保持结构完整
+                out_cols.append(pd.Series(None, index=df.index, name=t_key))
+                continue
+                
             clean_key = str(t_key).strip()
             if clean_key == 'order number':
                 out_cols.append(df[b_order_col].rename(t_key))
@@ -147,25 +158,23 @@ if all([file_a, file_b, file_c, file_d]):
                 col_name_to_extract = '刷单费用' if clean_key == '刷单' else clean_key
                 out_cols.append(df[col_name_to_extract].rename(t_key))
             else:
-                # 在算好的 df 中寻找匹配列
                 match = next((c for c in df.columns if str(c).strip().lower() == clean_key.lower()), None)
                 if match:
                     out_cols.append(df[match].rename(t_key))
                 else:
-                    # 找不到的填空列
                     out_cols.append(pd.Series(None, index=df.index, name=t_key))
 
         df_final_data = pd.concat(out_cols, axis=1)
         df_final_data.columns = df_a_raw.columns
 
         st.divider()
-        st.success("✅ 数据拼接与对齐全部完成！")
+        st.success("✅ 数据处理完毕，空白表头已自动忽略！")
         st.dataframe(df_final_data.head(10))
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_final_data.to_excel(writer)
-        st.download_button(label="📥 下载最终汇总表", data=output.getvalue(), file_name="Final_Report_Robust.xlsx")
+        st.download_button(label="📥 下载最终汇总表", data=output.getvalue(), file_name="Final_Report_Resolved.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行错误: {e}")
