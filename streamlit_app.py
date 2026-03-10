@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 
-st.set_page_config(page_title="TK 账单极速核算系统", layout="wide")
+st.set_page_config(page_title="TK 财务全能核算系统", layout="wide")
 
-st.title("📊 TikTok Shop 财务核算系统")
+st.title("📊 TikTok Shop 财务核算与多维分析系统")
 
 # ==========================================
 # 1. 侧边栏：核心参数
@@ -71,7 +72,6 @@ if all([file_a, file_b, file_c, file_d]):
         b_order_col = next((c for c in df_b.columns if 'order id' in to_key(c) or 'order number' in to_key(c)), None)
         c_order_col = next((c for c in df_c.columns if 'adjustment id' in to_key(c) or 'order id' in to_key(c)), None)
         
-        # 应用单号清洗器
         df_b['match_id'] = df_b[b_order_col].apply(clean_id)
         df_c['match_id'] = df_c[c_order_col].apply(clean_id)
         
@@ -134,9 +134,8 @@ if all([file_a, file_b, file_c, file_d]):
         df['佣金总计'] = df['佣金共计']
 
         # ==========================================
-        # 第五步：匹配成本表 (修复匹配逻辑)
+        # 第五步：匹配成本表
         # ==========================================
-        # 模糊匹配 SKU 和 成本列，只要包含关键词即可
         d_sku_actual = next((c for c in df_d.columns if 'nomor referensi sku' in to_key(c) or 'seller sku' in to_key(c)), None)
         d_cost_actual = next((c for c in df_d.columns if '成本' in to_key(c) or 'cost' in to_key(c) or '价格' in to_key(c)), None)
         
@@ -146,7 +145,6 @@ if all([file_a, file_b, file_c, file_d]):
             
             df_d_unique = df_d.drop_duplicates(subset=['match_sku'])
             df = pd.merge(df, df_d_unique[['match_sku', d_cost_actual]], on='match_sku', how='left')
-            # 这里的字段名必须直接叫 '成本'，才能匹配到模板 A 的表头
             df['成本'] = pd.to_numeric(df[d_cost_actual], errors='coerce').fillna(0)
         else:
             df['成本'] = 0.0
@@ -176,15 +174,14 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第七步：计算总成本
         # ==========================================
-        qty = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
-        # 总成本 = 数量 * 成本 * 汇率
-        df['总成本'] = qty * df['成本'] * rate_rmb_to_fx
+        df['Quantity_num'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
+        df['总成本'] = df['Quantity_num'] * df['成本'] * rate_rmb_to_fx
         
         df.loc[df['is_sd'] == True, '总成本'] = 0.0
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '总成本'] = 0.0
 
         # ==========================================
-        # 第八步：按比例分摊混合广告费
+        # 第八步 & 第九步：广告与毛利
         # ==========================================
         valid_sales_mask = df['order status'].astype(str).str.lower() != 'canceled'
         total_valid_sales = df.loc[valid_sales_mask, '实际售价'].sum()
@@ -193,39 +190,108 @@ if all([file_a, file_b, file_c, file_d]):
         if total_valid_sales > 0:
             df.loc[valid_sales_mask, '广告'] = (df.loc[valid_sales_mask, '实际售价'] / total_valid_sales) * total_ads_fx
 
-        # ==========================================
-        # 第九步：计算最终毛利
-        # ==========================================
         t_fee_col = 'Total Fees'
         t_fee_val = df[t_fee_col] if t_fee_col in df.columns else 0.0
-        
         df['毛利'] = df['实际售价'] + t_fee_val - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
 
         # ==========================================
-        # 最终组装
+        # 🟢 新增模块 1：构建 Sheet 1 (店铺汇总)
+        # ==========================================
+        total_qty = df['Quantity_num'].sum()
+        total_sales = df['实际售价'].sum()
+        total_ads = df['广告'].sum()
+        total_cost = df['总成本'].sum()
+        total_profit = df['毛利'].sum()
+
+        def pct(val, base):
+            return f"{(val/base)*100:.2f}%" if base > 0 else "0.00%"
+
+        summary_data = [
+            {'分析指标': '销售总额 (Actual Sales)', '金额/数值': total_sales, '占销售额百分比': '-'},
+            {'分析指标': '销售总数量 (Qty)', '金额/数值': total_qty, '占销售额百分比': '-'},
+            {'分析指标': '广告费用 (Ads)', '金额/数值': total_ads, '占销售额百分比': pct(total_ads, total_sales)},
+            {'分析指标': '总成本 (Cost)', '金额/数值': total_cost, '占销售额百分比': pct(total_cost, total_sales)},
+            {'分析指标': '毛利总额 (Gross Profit)', '金额/数值': total_profit, '占销售额百分比': pct(total_profit, total_sales)},
+        ]
+        
+        # 将各佣金项自动追加进汇总表
+        for fee in all_fee_columns:
+            if fee in df.columns:
+                fee_sum = df[fee].sum()
+                if fee_sum != 0:
+                    summary_data.append({
+                        '分析指标': f"【费项】{fee}",
+                        '金额/数值': fee_sum,
+                        '占销售额百分比': pct(fee_sum, total_sales)
+                    })
+        
+        df_summary = pd.DataFrame(summary_data)
+
+        # ==========================================
+        # 🟢 新增模块 2：构建 Sheet 2 (物流运费分析)
+        # ==========================================
+        shipping_cols = [
+            'Payment Fee', 'Shipping cost', 'Shipping costs passed on to the logistics provider', 
+            'Replacement shipping fee (passed on to the customer)', 'Exchange shipping fee (passed on to the customer)', 
+            'Shipping cost borne by the platform', 'Shipping cost paid by the customer', 
+            'Refunded shipping cost paid by the customer', 'Return shipping costs (passed on to the customer)', 
+            'Shipping cost subsidy', 'Distance shipping fee from Horizon+ Program'
+        ]
+        valid_ship_cols = [c for c in shipping_cols if c in df.columns]
+        
+        df_shipping = df.groupby('Seller sku')[valid_ship_cols].sum().reset_index()
+        df_shipping['物流相关费用总计'] = df_shipping[valid_ship_cols].sum(axis=1)
+        
+        # 按费用总计倒序排列，找出物流大头
+        df_shipping = df_shipping.sort_values(by='物流相关费用总计', ascending=True)
+
+        # ==========================================
+        # 🟢 新增模块 3：构建 Sheet 3 (SKU 深度分析)
+        # ==========================================
+        df_sku = df.groupby('Seller sku').agg(
+            销量=('Quantity_num', 'sum'),
+            销售额=('实际售价', 'sum'),
+            广告花费=('广告', 'sum'),
+            总成本=('总成本', 'sum'),
+            毛利=('毛利', 'sum')
+        ).reset_index()
+
+        df_sku['成本占比'] = df_sku.apply(lambda x: f"{(x['总成本']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+        df_sku['广告占比'] = df_sku.apply(lambda x: f"{(x['广告花费']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+        df_sku['毛利率'] = df_sku.apply(lambda x: f"{(x['毛利']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+        
+        # 按照销售额从大到小排序
+        df_sku = df_sku.sort_values(by='销售额', ascending=False)
+
+        # ==========================================
+        # 构建 Sheet 4 (原有的模板明细表)
         # ==========================================
         template_columns = df_a_raw.columns.tolist()
         df_final = pd.DataFrame(columns=template_columns)
-        
         df_cols_map = {to_key(c): c for c in df.columns}
-        
         for t_col in template_columns:
             if pd.isna(t_col): continue
-            
             clean_t_col = str(t_col).replace('\n', ' ').strip().lower()
             match_col = next((c for c in df.columns if str(c).replace('\n', ' ').strip().lower() == clean_t_col), None)
-            
             if match_col:
                 df_final[t_col] = df[match_col]
 
+        # ==========================================
+        # 打包导出多 Sheet Excel
+        # ==========================================
         st.divider()
-        st.success("✅ 核算完毕！【成本】列已修复匹配逻辑，数据完全对齐。")
-        st.dataframe(df_final.head(15))
+        st.success("✅ 核算完毕！已成功生成包含四大分析维度的数据报表。")
+        st.dataframe(df_summary)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_final.to_excel(writer, index=False)
-        st.download_button(label="📥 下载最终核算报表", data=output.getvalue(), file_name="TK_Financial_Report_Final.xlsx")
+            # 写入四大工作表
+            df_summary.to_excel(writer, sheet_name='店铺汇总', index=False)
+            df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
+            df_shipping.to_excel(writer, sheet_name='物流费分析', index=False)
+            df_final.to_excel(writer, sheet_name='账单明细(表A)', index=False)
+            
+        st.download_button(label="📥 下载多维数据报表 (包含 4 个 Sheet)", data=output.getvalue(), file_name="TK_Dashboard_Report.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行发生异常: {e}")
