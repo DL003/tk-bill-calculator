@@ -31,8 +31,8 @@ col1, col2, col3 = st.columns(3)
 col4, col5, _ = st.columns(3)
 
 with col1: file_a = st.file_uploader("表 A (模板表 - 读第2行)", type=["xlsx", "csv"])
-with col2: file_b = st.file_uploader("表 B (销售表 - Order details)", type=["xlsx", "csv"])
-with col3: file_c = st.file_uploader("表 C (收入表)", type=["xlsx", "csv"])
+with col2: file_b = st.file_uploader("表 B (销售表 - 单一Sheet)", type=["xlsx", "csv"])
+with col3: file_c = st.file_uploader("表 C (收入表 - 寻找 Order details)", type=["xlsx", "csv"])
 with col4: file_d = st.file_uploader("表 D (成本表)", type=["xlsx", "csv"])
 with col5: file_e = st.file_uploader("表 E (刷单表 - 可选)", type=["xlsx", "csv"])
 
@@ -48,13 +48,19 @@ if all([file_a, file_b, file_c, file_d]):
         # 表 A：真正的表头在第二排 (header=1)
         df_a_raw = pd.read_excel(file_a, header=1) if file_a.name.endswith('xlsx') else pd.read_csv(file_a, header=1)
         
-        # 表 B：真正的表头在第一排 (header=0)，且指定读取 'Order details' sheet
-        if file_b.name.endswith('xlsx'):
-            df_b = pd.read_excel(file_b, header=0, sheet_name='Order details')
-        else:
-            df_b = pd.read_csv(file_b, header=0)
+        # 表 B：只有一个 Sheet，直接读取第一排 (header=0)
+        df_b = pd.read_excel(file_b, header=0) if file_b.name.endswith('xlsx') else pd.read_csv(file_b, header=0)
             
-        df_c = pd.read_excel(file_c) if file_c.name.endswith('xlsx') else pd.read_csv(file_c)
+        # 表 C：寻找 'Order details' sheet
+        if file_c.name.endswith('xlsx'):
+            xl_c = pd.ExcelFile(file_c)
+            # 自动寻找名字里包含 order 和 detail 的 sheet
+            target_sheet_c = next((s for s in xl_c.sheet_names if 'order' in s.lower() and 'detail' in s.lower()), xl_c.sheet_names[0])
+            df_c = pd.read_excel(file_c, sheet_name=target_sheet_c)
+            st.info(f"💡 表 C 已自动读取 Sheet: **{target_sheet_c}**")
+        else:
+            df_c = pd.read_csv(file_c)
+            
         df_d = pd.read_excel(file_d) if file_d.name.endswith('xlsx') else pd.read_csv(file_d)
 
         # 统一核心 ID 格式（转字符串、去空格、转小写，实现不区分大小写匹配）
@@ -67,7 +73,6 @@ if all([file_a, file_b, file_c, file_d]):
         # 提取表 B 规定字段
         b_cols_needed = ['order status', 'Seller sku', 'Quantity', 'Sku Quantity of return', 
                          'SKU Platform Discount', 'SKU Seller Discount', 'SKU Subtotal After Discount']
-        # 找到表 B 中实际对应的列名 (忽略大小写)
         b_col_map = {to_key(c): c for c in df_b.columns}
         
         # 构建基础操作表
@@ -88,7 +93,7 @@ if all([file_a, file_b, file_c, file_d]):
         v_sub_after = pd.to_numeric(df['SKU Subtotal After Discount'], errors='coerce').fillna(0)
         
         df['实际售价'] = v_plat + v_sub_after
-        # 状态判断 (忽略大小写)
+        # 状态判断 (Canceled 时记为 0)
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '实际售价'] = 0.0
 
         # ==========================================
@@ -105,7 +110,7 @@ if all([file_a, file_b, file_c, file_d]):
             'Installation service fee', 'Ajustment amount'
         ]
         
-        # 匹配并将 C 表数据拉过来，除以订单统计进行分摊
+        # 去重后合并表 C
         df_c_unique = df_c.drop_duplicates(subset=['match_id'])
         df = pd.merge(df, df_c_unique[['match_id'] + [c_col_map[to_key(f)] for f in fee_columns if to_key(f) in c_col_map]], on='match_id', how='left')
         
@@ -120,6 +125,7 @@ if all([file_a, file_b, file_c, file_d]):
             else:
                 df[fee] = 0.0
                 
+        # 佣金总计 = 所有明细费用的 sum
         df['佣金总计'] = df[佣金计算项].sum(axis=1)
 
         # ==========================================
@@ -130,7 +136,6 @@ if all([file_a, file_b, file_c, file_d]):
         d_cost_actual = d_col_map.get('cost') or d_col_map.get('成本') or d_col_map.get('价格')
         
         if d_sku_actual and d_cost_actual:
-            # 统一 SKU 大小写进行匹配
             df_d['match_sku'] = df_d[d_sku_actual].astype(str).str.strip().str.lower()
             df['match_sku'] = df['Seller sku'].astype(str).str.strip().str.lower()
             
@@ -159,7 +164,9 @@ if all([file_a, file_b, file_c, file_d]):
                 df = pd.merge(df, df_e_unique[['match_id', e_fee_actual]], on='match_id', how='left')
                 
                 df['is_sd'] = df[e_fee_actual].notnull()
+                # 刷单金额转目标外币
                 df['刷单'] = pd.to_numeric(df[e_fee_actual], errors='coerce').fillna(0) * rate_rmb_to_fx
+                # 刷单佣金 12 RMB 转目标外币
                 df['刷单佣金'] = df['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
 
         # ==========================================
@@ -185,19 +192,16 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第九步：计算最终毛利
         # ==========================================
+        # 毛利 = 实际售价 + Total fees - 总成本 - 广告 - 刷单 - 刷单佣金
         df['毛利'] = df['实际售价'] + df['Total fees'] - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
-        
-        # 对于 Canceled 订单，毛利强制作 0 处理（如果你的业务规则需要）
-        # df.loc[~valid_sales_mask, '毛利'] = 0.0 
 
         # ==========================================
         # 最终组装回表 A 模板格式
         # ==========================================
-        # 读取原始表 A 的列名顺序
         template_columns = df_a_raw.columns.tolist()
         df_final = pd.DataFrame(columns=template_columns)
         
-        # 将我们计算好的字典，按名字映射进去 (不区分大小写映射)
+        # 将我们计算好的列名，按模板所需的名字映射进去
         df_cols_map = {to_key(c): c for c in df.columns}
         
         for t_col in template_columns:
@@ -207,14 +211,14 @@ if all([file_a, file_b, file_c, file_d]):
                 df_final[t_col] = df[match_col]
 
         st.divider()
-        st.success("✅ 全新核算系统运行成功！数据结构清爽无报错。")
+        st.success("✅ 核算系统运行成功！数据结构清爽无报错。")
         st.dataframe(df_final.head(15))
 
         # 导出
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False)
-        st.download_button(label="📥 一键下载最终财务报表", data=output.getvalue(), file_name="TK_Financial_Report.xlsx")
+        st.download_button(label="📥 一键下载最终财务报表", data=output.getvalue(), file_name="TK_Financial_Report_Final.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行发生异常，请检查表格格式: {e}")
