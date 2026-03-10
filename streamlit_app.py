@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="TK 账单助手-单号对齐版", layout="wide")
+st.set_page_config(page_title="TK 账单助手-终极拼接版", layout="wide")
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -16,97 +16,156 @@ st.header("2. 数据上传")
 col_a, col_b, col_c = st.columns(3)
 col_d, col_e, _ = st.columns(3)
 
-with col_a: file_a = st.file_uploader("上传【表 A 模板】(第二行为 Key)", type=["xlsx"])
-with col_b: file_b = st.file_uploader("上传【表 B】(第一行为 Key)", type=["xlsx"])
-with col_c: file_c = st.file_uploader("上传【表 C】(订单收入明细)", type=["xlsx"])
-with col_d: file_d = st.file_uploader("上传【表 D】(成本表)", type=["xlsx"])
-with col_e: file_e = st.file_uploader("上传【表 E】(刷单表-可选)", type=["xlsx"])
+with col_a: file_a = st.file_uploader("上传【表 A 模板】(双行表头)", type=["xlsx", "csv"])
+with col_b: file_b = st.file_uploader("上传【表 B】(销售表)", type=["xlsx", "csv"])
+with col_c: file_c = st.file_uploader("上传【表 C】(收入表)", type=["xlsx", "csv"])
+with col_d: file_d = st.file_uploader("上传【表 D】(成本表)", type=["xlsx", "csv"])
+with col_e: file_e = st.file_uploader("上传【表 E】(刷单-可选)", type=["xlsx", "csv"])
 
 def find_col_regex(columns, pattern):
-    """在列名列表中进行正则搜索"""
     for col in columns:
         if re.search(pattern, str(col), re.IGNORECASE):
             return col
     return None
 
+def load_file(file_obj, header_config):
+    if file_obj.name.endswith('.csv'):
+        return pd.read_csv(file_obj, header=header_config)
+    return pd.read_excel(file_obj, header=header_config)
+
 if all([file_a, file_b, file_c, file_d]):
     try:
-        # 1. 精准读取不同格式的表格
-        # 表 A：双层表头，取第二层(Index 1)作为程序 Key
-        df_a_raw = pd.read_excel(file_a, header=[0, 1])
+        # 1. 精准读取
+        df_a_raw = load_file(file_a, header=[0, 1])
         template_keys = df_a_raw.columns.get_level_values(1).tolist()
         
-        # 表 B：双层表头，取第一层(Index 0)作为程序 Key
-        df_b_raw = pd.read_excel(file_b, header=[0, 1])
+        df_b_raw = load_file(file_b, header=[0, 1])
         df_b = df_b_raw.copy()
         df_b.columns = df_b_raw.columns.get_level_values(0).tolist()
 
-        # 表 C：单层表头识别
-        df_c = pd.read_excel(file_c)
-        df_d = pd.read_excel(file_d)
+        if file_c.name.endswith('.csv'):
+            df_c = pd.read_csv(file_c)
+        else:
+            xl_c = pd.ExcelFile(file_c)
+            target_sheet = next((s for s in xl_c.sheet_names if 'order' in s.lower() and 'detail' in s.lower()), xl_c.sheet_names[0])
+            df_c = pd.read_excel(file_c, sheet_name=target_sheet)
+            
+        df_d = load_file(file_d, header=0)
 
-        # 2. 识别核心匹配列 (锁定 Order ID = order number)
+        # 2. 识别核心匹配列
         b_order_col = find_col_regex(df_b.columns, r'Order ID|Order Number')
         c_order_col = find_col_regex(df_c.columns, r'Order/adjustment ID|Order ID|Order Number')
         b_sku_col = find_col_regex(df_b.columns, r'Seller SKU')
         d_sku_col = find_col_regex(df_d.columns, r'Seller SKU|SKU')
+        b_qty_col = find_col_regex(df_b.columns, r'sold quantity|quantity')
+        b_status_col = find_col_regex(df_b.columns, r'Status')
         
-        # 3. 统一单号格式为字符串，消除 ID 类型不匹配报错
+        # 3. 统一单号格式为字符串，消除 ID 类型不匹配
         df_b[b_order_col] = df_b[b_order_col].astype(str).str.strip()
         df_c[c_order_col] = df_c[c_order_col].astype(str).str.strip()
         df_b[b_sku_col] = df_b[b_sku_col].astype(str).str.strip()
         df_d[d_sku_col] = df_d[d_sku_col].astype(str).str.strip()
 
-        # 4. 字段匹配与分摊逻辑
+        # 4. 费项映射
+        fee_mapping = {}
+        for c_col in df_c.columns:
+            clean_c = re.sub(r'\(.*?\)', '', str(c_col)).strip().lower()
+            for t_key in template_keys:
+                if str(t_key).strip().lower() == clean_c or str(t_key).strip().lower() == str(c_col).lower():
+                    fee_mapping[c_col] = t_key
+
+        # 5. 合并与计算
         df_b['订单统计'] = df_b.groupby(b_order_col)[b_order_col].transform('count')
         
-        # 将表 C 数据根据单号合并到表 B
-        # 自动寻找模板(A)中需要的费项字段
-        common_fees = [c for c in df_c.columns if any(str(c).lower().startswith(str(t).lower()) for t in template_keys) and c != c_order_col]
+        common_fees = [c for c in fee_mapping.keys() if c != c_order_col]
         df = pd.merge(df_b, df_c[[c_order_col] + common_fees], left_on=b_order_col, right_on=c_order_col, how='left')
 
-        # 费用分摊：将合并过来的费项除以订单统计
+        # 分摊费用 (强制转换为数字以防报错)
         for c_col in common_fees:
-            # 找到对应的模板列名
-            t_col = next((t for t in template_keys if str(c_col).lower().startswith(str(t).lower())), None)
-            if t_col and t_col not in ['order number', 'order status']:
-                df[t_col] = df[c_col].fillna(0) / df['订单统计']
+            t_key = fee_mapping[c_col]
+            if t_key.lower() not in ['order number', 'order id']:
+                numeric_vals = pd.to_numeric(df[c_col], errors='coerce').fillna(0)
+                df[t_key] = numeric_vals / df['订单统计']
 
-        # 5. 售价计算逻辑
+        # 售价计算
         s_sub = find_col_regex(df_b.columns, r'Subtotal Before Discount')
         s_plat = find_col_regex(df_b.columns, r'Platform Discount')
         s_seller = find_col_regex(df_b.columns, r'Seller Discount')
         
-        # 实际售价 = (小计 - 平台折 - 卖家折) + 平台折
-        df['实际售价'] = (df[s_sub].fillna(0) - df[s_plat].fillna(0) - df[s_seller].fillna(0)) + df[s_plat].fillna(0)
+        v_sub = pd.to_numeric(df[s_sub], errors='coerce').fillna(0) if s_sub else 0
+        v_plat = pd.to_numeric(df[s_plat], errors='coerce').fillna(0) if s_plat else 0
+        v_sell = pd.to_numeric(df[s_seller], errors='coerce').fillna(0) if s_seller else 0
+        df['实际售价'] = (v_sub - v_plat - v_sell) + v_plat
 
-        # 6. 成本匹配 (表 D)
+        # 成本匹配
         d_cost_col = find_col_regex(df_d.columns, r'cost|成本|价格')
         df = pd.merge(df, df_d[[d_sku_col, d_cost_col]], left_on=b_sku_col, right_on=d_sku_col, how='left')
-        b_qty_col = find_col_regex(df_b.columns, r'Quantity')
-        df['总成本'] = df[b_qty_col] * (df[d_cost_col].fillna(0) * rate_rmb_to_fx)
-
-        # 7. 生成最终结果并映射回模板 A 的表头
-        df_final = df.reindex(columns=template_keys)
         
-        # 强制对齐订单号：把识别到的 B 表单号填入模板的 'order number' 列
-        df_final['order number'] = df[b_order_col]
-        df_final['订单统计'] = df['订单统计']
-        # ... 其他计算字段同样对齐 ...
-        if '实际售价' in template_keys: df_final['实际售价'] = df['实际售价']
-        if '总成本' in template_keys: df_final['总成本'] = df['总成本']
+        # 刷单处理
+        df['is_sd'] = False
+        df['刷单费用'] = 0.0
+        if file_e:
+            df_e = load_file(file_e, header=0)
+            e_order_col = find_col_regex(df_e.columns, r'Order ID|Order Number|单号')
+            e_fee_col = find_col_regex(df_e.columns, r'fee|费用|刷单')
+            if e_order_col and e_fee_col:
+                df_e[e_order_col] = df_e[e_order_col].astype(str).str.strip()
+                df = pd.merge(df, df_e[[e_order_col, e_fee_col]], left_on=b_order_col, right_on=e_order_col, how='left')
+                df['is_sd'] = df[e_fee_col].notnull()
+                df['刷单费用'] = pd.to_numeric(df[e_fee_col], errors='coerce').fillna(0) * rate_rmb_to_fx
+        
+        df['刷单佣金'] = df['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
 
-        # 恢复双层表头导出
-        df_final.columns = df_a_raw.columns
+        # 成本与毛利计算
+        qty_numeric = pd.to_numeric(df[b_qty_col], errors='coerce').fillna(0)
+        cost_numeric = pd.to_numeric(df[d_cost_col], errors='coerce').fillna(0)
+        df['总成本'] = df.apply(lambda x: (x.name, qty_numeric[x.name] * cost_numeric[x.name] * rate_rmb_to_fx)[1] if not df['is_sd'][x.name] else 0, axis=1)
+
+        valid_mask = df[b_status_col].astype(str).str.lower() != 'canceled'
+        total_sales = df.loc[valid_mask, '实际售价'].sum()
+        df['广告'] = 0.0
+        if total_sales > 0:
+            df.loc[valid_mask, '广告'] = (df.loc[valid_mask, '实际售价'] / total_sales) * ads_total_fx
+
+        c_total_fee_col = find_col_regex(df_c.columns, r'Total fees')
+        df['毛利'] = 0.0
+        if c_total_fee_col:
+            fee_vals = pd.to_numeric(df[c_total_fee_col], errors='coerce').fillna(0)
+            df.loc[valid_mask, '毛利'] = df['实际售价'] + (fee_vals/df['订单统计']) - df['总成本'] - df['广告'] - df['刷单费用'] - df['刷单佣金']
+
+        # 6. 【核心修复】列拼接构建最终表，杜绝索引错误
+        out_cols = []
+        for t_key in template_keys:
+            clean_key = str(t_key).strip()
+            if clean_key == 'order number':
+                out_cols.append(df[b_order_col].rename(t_key))
+            elif clean_key == 'order status':
+                out_cols.append(df[b_status_col].rename(t_key))
+            elif clean_key == 'Seller sku':
+                out_cols.append(df[b_sku_col].rename(t_key))
+            elif clean_key in ['订单统计', '实际售价', '总成本', '广告', '毛利', '刷单', '刷单佣金']:
+                col_name_to_extract = '刷单费用' if clean_key == '刷单' else clean_key
+                out_cols.append(df[col_name_to_extract].rename(t_key))
+            else:
+                # 在算好的 df 中寻找匹配列
+                match = next((c for c in df.columns if str(c).strip().lower() == clean_key.lower()), None)
+                if match:
+                    out_cols.append(df[match].rename(t_key))
+                else:
+                    # 找不到的填空列
+                    out_cols.append(pd.Series(None, index=df.index, name=t_key))
+
+        df_final_data = pd.concat(out_cols, axis=1)
+        df_final_data.columns = df_a_raw.columns
 
         st.divider()
-        st.success("✅ 订单号对齐成功！正在生成报表...")
-        st.dataframe(df_final.head(10))
+        st.success("✅ 数据拼接与对齐全部完成！")
+        st.dataframe(df_final_data.head(10))
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_final.to_excel(writer)
-        st.download_button(label="📥 下载填充好的汇总表 A", data=output.getvalue(), file_name="Final_Report_Aligned.xlsx")
+            df_final_data.to_excel(writer)
+        st.download_button(label="📥 下载最终汇总表", data=output.getvalue(), file_name="Final_Report_Robust.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行错误: {e}")
