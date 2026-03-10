@@ -1,25 +1,24 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 
 st.set_page_config(page_title="TK 账单极速核算系统", layout="wide")
 
 st.title("📊 TikTok Shop 财务核算系统")
 
 # ==========================================
-# 1. 侧边栏：核心参数与多币种广告配置
+# 1. 侧边栏：核心参数
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 汇率与成本配置")
     rate_rmb_to_fx = st.number_input("RMB 兑 目标外币 汇率 (如 1 RMB = 2200 IDR)", value=2200.0)
     
     st.header("📢 广告费多币种录入")
-    st.caption("支持混录不同币种，系统将自动统一为目标外币进行分摊。")
     ad_target_currency = st.number_input("目标外币广告费 (如直接充值的印尼盾)", value=0.0)
     ad_other_currency = st.number_input("其他外币广告费 (如充值的美金)", value=0.0)
     rate_other_to_target = st.number_input("其他外币 兑 目标外币 汇率 (如 1 USD = 15000 IDR)", value=15000.0)
     
-    # 计算总广告费
     total_ads_fx = ad_target_currency + (ad_other_currency * rate_other_to_target)
     st.success(f"参与分摊的广告总额: {total_ads_fx:,.2f}")
 
@@ -31,53 +30,58 @@ col1, col2, col3 = st.columns(3)
 col4, col5, _ = st.columns(3)
 
 with col1: file_a = st.file_uploader("表 A (模板表 - 读第2行)", type=["xlsx", "csv"])
-with col2: file_b = st.file_uploader("表 B (销售表 - 单一Sheet)", type=["xlsx", "csv"])
-with col3: file_c = st.file_uploader("表 C (收入表 - 寻找 Order details)", type=["xlsx", "csv"])
+with col2: file_b = st.file_uploader("表 B (销售表)", type=["xlsx", "csv"])
+with col3: file_c = st.file_uploader("表 C (收入表)", type=["xlsx", "csv"])
 with col4: file_d = st.file_uploader("表 D (成本表)", type=["xlsx", "csv"])
 with col5: file_e = st.file_uploader("表 E (刷单表 - 可选)", type=["xlsx", "csv"])
 
-# 辅助函数：安全转小写匹配
+# 辅助函数：安全转小写
 def to_key(s):
     return str(s).strip().lower()
+
+# 辅助函数：终极单号清洗器 (解决科学计数法 5.814e+17 和 .0 后缀)
+def clean_id(x):
+    s = str(x).strip().lower()
+    if 'e+' in s:
+        try:
+            return str(int(float(s)))
+        except:
+            pass
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s
 
 if all([file_a, file_b, file_c, file_d]):
     try:
         # ==========================================
-        # 第一步：精准读取与基础字段映射
+        # 第一步：精准读取
         # ==========================================
-        # 表 A：真正的表头在第二排 (header=1)
         df_a_raw = pd.read_excel(file_a, header=1) if file_a.name.endswith('xlsx') else pd.read_csv(file_a, header=1)
-        
-        # 表 B：只有一个 Sheet，直接读取第一排 (header=0)
         df_b = pd.read_excel(file_b, header=0) if file_b.name.endswith('xlsx') else pd.read_csv(file_b, header=0)
             
-        # 表 C：寻找 'Order details' sheet
         if file_c.name.endswith('xlsx'):
             xl_c = pd.ExcelFile(file_c)
-            # 自动寻找名字里包含 order 和 detail 的 sheet
             target_sheet_c = next((s for s in xl_c.sheet_names if 'order' in s.lower() and 'detail' in s.lower()), xl_c.sheet_names[0])
             df_c = pd.read_excel(file_c, sheet_name=target_sheet_c)
-            st.info(f"💡 表 C 已自动读取 Sheet: **{target_sheet_c}**")
         else:
             df_c = pd.read_csv(file_c)
             
         df_d = pd.read_excel(file_d) if file_d.name.endswith('xlsx') else pd.read_csv(file_d)
 
-        # 统一核心 ID 格式（转字符串、去空格、转小写，实现不区分大小写匹配）
-        b_order_col = next((c for c in df_b.columns if to_key(c) == 'order id'), None)
-        c_order_col = next((c for c in df_c.columns if to_key(c) == 'order/adjustment id'), None)
+        # 获取核心列名
+        b_order_col = next((c for c in df_b.columns if 'order id' in to_key(c) or 'order number' in to_key(c)), None)
+        c_order_col = next((c for c in df_c.columns if 'adjustment id' in to_key(c) or 'order id' in to_key(c)), None)
         
-        df_b['match_id'] = df_b[b_order_col].astype(str).str.strip().str.lower()
-        df_c['match_id'] = df_c[c_order_col].astype(str).str.strip().str.lower()
+        # 应用单号清洗器
+        df_b['match_id'] = df_b[b_order_col].apply(clean_id)
+        df_c['match_id'] = df_c[c_order_col].apply(clean_id)
         
-        # 提取表 B 规定字段
         b_cols_needed = ['order status', 'Seller sku', 'Quantity', 'Sku Quantity of return', 
                          'SKU Platform Discount', 'SKU Seller Discount', 'SKU Subtotal After Discount']
         b_col_map = {to_key(c): c for c in df_b.columns}
         
-        # 构建基础操作表
         df = pd.DataFrame()
-        df['order number'] = df_b[b_order_col] # 还原原始单号大小写
+        df['order number'] = df_b[b_order_col] 
         df['match_id'] = df_b['match_id']
         
         for col in b_cols_needed:
@@ -93,43 +97,52 @@ if all([file_a, file_b, file_c, file_d]):
         v_sub_after = pd.to_numeric(df['SKU Subtotal After Discount'], errors='coerce').fillna(0)
         
         df['实际售价'] = v_plat + v_sub_after
-        # 状态判断 (Canceled 时记为 0)
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '实际售价'] = 0.0
 
         # ==========================================
-        # 第三步 & 第四步：匹配表 C 费用并计算佣金总计
+        # 第三步：匹配表 C 最新制定的 36 项费用
         # ==========================================
         c_col_map = {to_key(c): c for c in df_c.columns}
-        fee_columns = [
-            'Total fees', 'TikTok Shop commission fee', 'Flat fee', 'Sales fee', 'Pre-Order Service Fee', 
-            'Mall service fee', 'Payment fee', 'Shipping cost', 'Affiliate commission', 'Affiliate partner commission', 
-            'Affiliate Shop Ads commission', 'Affiliate Partner shop ads commission', 'Shipping Fee Program service fee', 
-            'Dynamic Commission', 'Bonus cashback service fee', 'LIVE Specials service fee', 'Voucher Xtra service fee', 
-            'Order processing fee', 'EAMS Program service fee', 'Brands Crazy Deals/Flash Sale service fee', 
-            'Dilayani Tokopedia fee', 'Dilayani Tokopedia handling fee', 'PayLater program fee', 'Campaign resource fee', 
-            'Installation service fee', 'Ajustment amount'
+        
+        # 最新的费用列表 (包含 Total fees, 但不在佣金求和里)
+        all_fee_columns = [
+            'Total Fees', 'Platform commission fee', 'Pre-order service fee', 'Mall service fee', 'Payment Fee', 
+            'Shipping cost', 'Shipping costs passed on to the logistics provider', 'Replacement shipping fee (passed on to the customer)', 
+            'Exchange shipping fee (passed on to the customer)', 'Shipping cost borne by the platform', 'Shipping cost paid by the customer', 
+            'Refunded shipping cost paid by the customer', 'Return shipping costs (passed on to the customer)', 'Shipping cost subsidy', 
+            'Distance shipping fee from Horizon+ Program', 'Affiliate Commission', 'Affiliate partner commission', 'Affiliate Shop Ads commission', 
+            'Affiliate Partner shop ads commission', 'Shipping Fee Program service fee', 'Dynamic commission', 'Bonus cashback service fee', 
+            'LIVE Specials service fee', 'Voucher Xtra service fee', 'Order processing fee', 'EAMS Program service fee', 
+            'Brands Crazy Deals/Flash Sale service fee', 'Dilayani Tokopedia fee', 'Dilayani Tokopedia handling fee', 'PayLater program fee', 
+            'Campaign resource fee', 'Installation service fee', 'Article 22 Income Tax withheld', 'Platform special service fee', 
+            'GMV Max ad fee', 'Ajustment amount'
         ]
         
-        # 去重后合并表 C
+        # 找到表C中实际存在的列名进行合并
+        valid_c_cols = [c_col_map[to_key(f)] for f in all_fee_columns if to_key(f) in c_col_map]
         df_c_unique = df_c.drop_duplicates(subset=['match_id'])
-        df = pd.merge(df, df_c_unique[['match_id'] + [c_col_map[to_key(f)] for f in fee_columns if to_key(f) in c_col_map]], on='match_id', how='left')
+        df = pd.merge(df, df_c_unique[['match_id'] + valid_c_cols], on='match_id', how='left')
         
-        佣金计算项 = []
-        for fee in fee_columns:
+        # 分摊计算
+        佣金求和项 = []
+        for fee in all_fee_columns:
             actual_c_col = c_col_map.get(to_key(fee))
             if actual_c_col:
-                # 分摊费项
+                # 分摊
                 df[fee] = pd.to_numeric(df[actual_c_col], errors='coerce').fillna(0) / df['订单统计']
-                if fee != 'Total fees':
-                    佣金计算项.append(fee)
+                # 第四步：排除 Total Fees，将其余项加入佣金求和名单
+                if to_key(fee) != 'total fees':
+                    佣金求和项.append(fee)
             else:
                 df[fee] = 0.0
                 
-        # 佣金总计 = 所有明细费用的 sum
-        df['佣金总计'] = df[佣金计算项].sum(axis=1)
+        # 计算佣金共计
+        df['佣金共计'] = df[佣金求和项].sum(axis=1)
+        # 为了兼容你模板可能写的“佣金总计”
+        df['佣金总计'] = df['佣金共计']
 
         # ==========================================
-        # 第五步：匹配表 D 成本表 (RMB 转 外币)
+        # 第五步：匹配成本表
         # ==========================================
         d_col_map = {to_key(c): c for c in df_d.columns}
         d_sku_actual = d_col_map.get('nomor referensi sku')
@@ -159,14 +172,12 @@ if all([file_a, file_b, file_c, file_d]):
             e_fee_actual = next((c for c in df_e.columns if 'fee' in to_key(c) or '刷单' in to_key(c) or '费用' in to_key(c)), None)
             
             if e_order_actual and e_fee_actual:
-                df_e['match_id'] = df_e[e_order_actual].astype(str).str.strip().str.lower()
+                df_e['match_id'] = df_e[e_order_actual].apply(clean_id)
                 df_e_unique = df_e.drop_duplicates(subset=['match_id'])
                 df = pd.merge(df, df_e_unique[['match_id', e_fee_actual]], on='match_id', how='left')
                 
                 df['is_sd'] = df[e_fee_actual].notnull()
-                # 刷单金额转目标外币
                 df['刷单'] = pd.to_numeric(df[e_fee_actual], errors='coerce').fillna(0) * rate_rmb_to_fx
-                # 刷单佣金 12 RMB 转目标外币
                 df['刷单佣金'] = df['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
 
         # ==========================================
@@ -175,7 +186,6 @@ if all([file_a, file_b, file_c, file_d]):
         qty = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
         df['总成本'] = qty * df['RMB成本'] * rate_rmb_to_fx
         
-        # 刷单或取消，总成本记为 0
         df.loc[df['is_sd'] == True, '总成本'] = 0.0
         df.loc[df['order status'].astype(str).str.lower() == 'canceled', '总成本'] = 0.0
 
@@ -192,33 +202,40 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第九步：计算最终毛利
         # ==========================================
-        # 毛利 = 实际售价 + Total fees - 总成本 - 广告 - 刷单 - 刷单佣金
-        df['毛利'] = df['实际售价'] + df['Total fees'] - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
+        # 取出 Total Fees 参与毛利计算，如果没有匹配到默认为0
+        t_fee_col = 'Total Fees'
+        t_fee_val = df[t_fee_col] if t_fee_col in df.columns else 0.0
+        
+        df['毛利'] = df['实际售价'] + t_fee_val - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
 
         # ==========================================
-        # 最终组装回表 A 模板格式
+        # 最终组装
         # ==========================================
         template_columns = df_a_raw.columns.tolist()
         df_final = pd.DataFrame(columns=template_columns)
         
-        # 将我们计算好的列名，按模板所需的名字映射进去
         df_cols_map = {to_key(c): c for c in df.columns}
         
         for t_col in template_columns:
             if pd.isna(t_col): continue
-            match_col = df_cols_map.get(to_key(t_col))
+            
+            # 去除可能包含的换行符和多余空格再进行匹配
+            clean_t_col = str(t_col).replace('\n', ' ').strip().lower()
+            
+            # 尝试各种清洗后的匹配
+            match_col = next((c for c in df.columns if str(c).replace('\n', ' ').strip().lower() == clean_t_col), None)
+            
             if match_col:
                 df_final[t_col] = df[match_col]
 
         st.divider()
-        st.success("✅ 核算系统运行成功！数据结构清爽无报错。")
+        st.success("✅ 核算完毕！已更新 36 项费用清单及佣金计算规则。")
         st.dataframe(df_final.head(15))
 
-        # 导出
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False)
-        st.download_button(label="📥 一键下载最终财务报表", data=output.getvalue(), file_name="TK_Financial_Report_Final.xlsx")
+        st.download_button(label="📥 下载最终核算报表", data=output.getvalue(), file_name="TK_Financial_Report_Final.xlsx")
 
     except Exception as e:
-        st.error(f"❌ 运行发生异常，请检查表格格式: {e}")
+        st.error(f"❌ 运行发生异常: {e}")
