@@ -195,7 +195,7 @@ if all([file_a, file_b, file_c, file_d]):
         df['毛利'] = df['实际售价'] + t_fee_val - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
 
         # ==========================================
-        # 🟢 新增模块 1：构建 Sheet 1 (店铺汇总)
+        # 🟢 新增模块 1：构建 Sheet (店铺汇总)
         # ==========================================
         total_qty = df['Quantity_num'].sum()
         total_sales = df['实际售价'].sum()
@@ -228,7 +228,7 @@ if all([file_a, file_b, file_c, file_d]):
         df_summary = pd.DataFrame(summary_data)
 
         # ==========================================
-        # 🟢 新增模块 2：构建 Sheet 2 (物流运费分析)
+        # 🟢 新增模块 2：构建 Sheet (物流运费分析)
         # ==========================================
         shipping_cols = [
             'Payment Fee', 'Shipping cost', 'Shipping costs passed on to the logistics provider', 
@@ -242,11 +242,11 @@ if all([file_a, file_b, file_c, file_d]):
         df_shipping = df.groupby('Seller sku')[valid_ship_cols].sum().reset_index()
         df_shipping['物流相关费用总计'] = df_shipping[valid_ship_cols].sum(axis=1)
         
-        # 按费用总计倒序排列，找出物流大头
+        # 按费用总计倒序排列
         df_shipping = df_shipping.sort_values(by='物流相关费用总计', ascending=True)
 
         # ==========================================
-        # 🟢 新增模块 3：构建 Sheet 3 (SKU 深度分析)
+        # 🟢 新增模块 3：构建 Sheet (SKU 深度分析)
         # ==========================================
         df_sku = df.groupby('Seller sku').agg(
             销量=('Quantity_num', 'sum'),
@@ -264,7 +264,7 @@ if all([file_a, file_b, file_c, file_d]):
         df_sku = df_sku.sort_values(by='销售额', ascending=False)
 
         # ==========================================
-        # 构建 Sheet 4 (原有的模板明细表)
+        # 构建 Sheet (原有的模板明细表)
         # ==========================================
         template_columns = df_a_raw.columns.tolist()
         df_final = pd.DataFrame(columns=template_columns)
@@ -277,19 +277,19 @@ if all([file_a, file_b, file_c, file_d]):
                 df_final[t_col] = df[match_col]
 
         # ==========================================
-        # 打包导出多 Sheet Excel
+        # 【修改点】打包导出多 Sheet Excel (调整生成顺序)
         # ==========================================
         st.divider()
         st.success("✅ 核算完毕！已成功生成包含四大分析维度的数据报表。")
-        st.dataframe(df_summary)
+        st.dataframe(df_final.head(15)) # 网页展示也改回默认显示账单明细
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            # 写入四大工作表
+            # 写入四大工作表 (严格按照你要求的顺序)
+            df_final.to_excel(writer, sheet_name='账单明细(表A)', index=False)
             df_summary.to_excel(writer, sheet_name='店铺汇总', index=False)
             df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
             df_shipping.to_excel(writer, sheet_name='物流费分析', index=False)
-            df_final.to_excel(writer, sheet_name='账单明细(表A)', index=False)
             
         st.download_button(label="📥 下载多维数据报表 (包含 4 个 Sheet)", data=output.getvalue(), file_name="TK_Dashboard_Report.xlsx")
 
