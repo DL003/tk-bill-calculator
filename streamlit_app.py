@@ -3,7 +3,7 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="TK 账单助手-最终修复版", layout="wide")
+st.set_page_config(page_title="TK 账单助手-数据类型修复版", layout="wide")
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -39,13 +39,12 @@ if all([file_a, file_b, file_c, file_d]):
         df_c = pd.read_excel(file_c, sheet_name=target_sheet)
         df_d = pd.read_excel(file_d)
 
-        # --- 识别核心列 (关键修复点) ---
+        # --- 识别核心列 ---
         b_order_col = find_col(df_b, r'Order ID|Order Number')
         b_sku_col = find_col(df_b, r'Seller SKU')
         b_qty_col = find_col(df_b, r'Quantity')
         b_status_col = find_col(df_b, r'Status')
         
-        # 售价相关：匹配包含特定超长描述的列
         s_sub = find_col(df_b, r'Subtotal Before Discount')
         s_plat = find_col(df_b, r'Platform Discount')
         s_seller = find_col(df_b, r'Seller Discount')
@@ -54,11 +53,14 @@ if all([file_a, file_b, file_c, file_d]):
         d_sku_col = find_col(df_d, r'Seller SKU|SKU')
         d_cost_col = find_col(df_d, r'cost|成本|价格')
 
+        # --- 关键修复：统一订单号类型为字符串，并去除空格 ---
+        df_b[b_order_col] = df_b[b_order_col].astype(str).str.strip()
+        df_c[c_order_col] = df_c[c_order_col].astype(str).str.strip()
+
         # --- 建立费项映射 ---
         template_cols = df_template.columns.tolist()
         fee_mapping = {}
         for c_col in df_c.columns:
-            # 清洗掉括号和单位，尝试与模板列名匹配
             clean_c = re.sub(r'\(.*?\)', '', str(c_col)).strip()
             for t_col in template_cols:
                 if t_col.strip().lower() == clean_c.lower() or t_col.strip().lower() == str(c_col).lower():
@@ -68,7 +70,7 @@ if all([file_a, file_b, file_c, file_d]):
         # 1. 订单统计
         df_b['订单统计'] = df_b.groupby(b_order_col)[b_order_col].transform('count')
         
-        # 2. 合并表 C
+        # 2. 合并表 C (此时单号类型已统一)
         df = pd.merge(df_b, df_c[[c_order_col] + list(fee_mapping.keys())], left_on=b_order_col, right_on=c_order_col, how='left')
         
         # 3. 费用分摊
@@ -77,16 +79,19 @@ if all([file_a, file_b, file_c, file_d]):
                 df[t_col] = df[c_col].fillna(0) / df['订单统计']
 
         # 4. 匹配成本 (表 D)
+        # 同样统一 SKU 的类型
+        df_d[d_sku_col] = df_d[d_sku_col].astype(str).str.strip()
+        df[b_sku_col] = df[b_sku_col].astype(str).str.strip()
         df = pd.merge(df, df_d[[d_sku_col, d_cost_col]], left_on=b_sku_col, right_on=d_sku_col, how='left')
 
-        # 5. 计算实际售价 (核心公式)
+        # 5. 计算实际售价 (公式来自 User Summary)
         # It equals SKU Subtotal Before Discount - SKU Platform Discount - SKU Seller Discount + SKU Platform Discount
         v_sub = df[s_sub].fillna(0) if s_sub else 0
         v_plat = df[s_plat].fillna(0) if s_plat else 0
         v_sell = df[s_seller].fillna(0) if s_seller else 0
         df['实际售价'] = (v_sub - v_plat - v_sell) + v_plat
 
-        # 6. 广告分摊
+        # 6. 广告分摊 (排除 Canceled)
         valid_mask = df[b_status_col].astype(str).str.lower() != 'canceled'
         total_sales = df.loc[valid_mask, '实际售价'].sum()
         df['广告'] = 0.0
@@ -100,24 +105,20 @@ if all([file_a, file_b, file_c, file_d]):
         c_total_fee_col = find_col(df_c, r'Total fees')
         df['毛利'] = 0.0
         if c_total_fee_col:
-            # 实际售价 + 分摊后的Total fees - 总成本 - 广告
             df.loc[valid_mask, '毛利'] = df['实际售价'] + (df[c_total_fee_col].fillna(0)/df['订单统计']) - df['总成本'] - df['广告']
 
         # --- 导出 ---
-        # 确保所有核心列都在列名列表中
         for c in ['实际售价', '总成本', '广告', '毛利', '订单统计']:
             if c not in df.columns: df[c] = 0.0
             
         df_final = df.reindex(columns=template_cols)
-        
-        # 强制写回计算好的数值到模板定义的列中
         core_cols = ['实际售价', '总成本', '广告', '毛利', '订单统计']
         for c in core_cols:
             if c in template_cols:
                 df_final[c] = df[c]
 
         st.divider()
-        st.success(f"✅ 处理完成！已识别工作表: {target_sheet}")
+        st.success(f"✅ 成功匹配！已自动处理数据类型差异。")
         st.dataframe(df_final.head(30))
 
         output = io.BytesIO()
