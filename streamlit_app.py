@@ -60,7 +60,8 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第一步：精准读取与清洗
         # ==========================================
-        df_a_raw = pd.read_excel(file_a, header=1) if file_a.name.endswith('xlsx') else pd.read_csv(file_a, header=1)
+        # 【关键修复】保留双层表头，保证导出结果格式不被破坏
+        df_a_raw = pd.read_excel(file_a, header=[0, 1]) if file_a.name.endswith('xlsx') else pd.read_csv(file_a, header=[0, 1])
         df_b = pd.read_excel(file_b, header=0) if file_b.name.endswith('xlsx') else pd.read_csv(file_b, header=0)
             
         if file_c.name.endswith('xlsx'):
@@ -72,18 +73,17 @@ if all([file_a, file_b, file_c, file_d]):
             
         df_d = pd.read_excel(file_d) if file_d.name.endswith('xlsx') else pd.read_csv(file_d)
 
-        # 获取核心列名
         b_order_col = find_col_regex(df_b.columns, r'order id|order number')
         c_order_col = find_col_regex(df_c.columns, r'adjustment id|order id|order number')
         
-        # 删除 TikTok 导出的第一行解释文本
+        # 删除 TikTok 导出的第一行解释文本 (如 "Current order status.")
         if b_order_col:
             df_b = df_b[~df_b[b_order_col].astype(str).str.contains(r'Platform unique|Transaction|Order', flags=re.IGNORECASE, na=False)].reset_index(drop=True)
         if c_order_col:
             df_c = df_c[~df_c[c_order_col].astype(str).str.contains(r'Platform unique|Transaction|Order', flags=re.IGNORECASE, na=False)].reset_index(drop=True)
 
-        df_b['match_id'] = df_b[b_order_col].apply(clean_id)
-        df_c['match_id'] = df_c[c_order_col].apply(clean_id)
+        df_b['match_id'] = df_b[b_order_col].apply(clean_id) if b_order_col else ""
+        df_c['match_id'] = df_c[c_order_col].apply(clean_id) if c_order_col else ""
         
         # 锁定表 B 的各种字段
         b_status = find_col_regex(df_b.columns, r'order status|status')
@@ -122,10 +122,9 @@ if all([file_a, file_b, file_c, file_d]):
             'GMV Max ad fee', 'Ajustment amount'
         ]
         
-        # 寻找表C中对应的列名
         fee_cols_in_c = {}
         for fee in all_fee_columns:
-            c_col = find_col_regex(df_c.columns, r'^' + re.escape(fee) + r'$|' + re.escape(fee))
+            c_col = find_col_regex(df_c.columns, r'(?i)' + re.escape(fee))
             if c_col: fee_cols_in_c[fee] = c_col
 
         df_c_unique = df_c.drop_duplicates(subset=['match_id'])
@@ -178,7 +177,7 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第七步：计算总成本
         # ==========================================
-        qty_series = pd.to_numeric(df_b[b_qty], errors='coerce').fillna(0) if b_qty else 0
+        qty_series = pd.to_numeric(df_b[b_qty], errors='coerce').fillna(0) if b_qty else pd.Series(0, index=df_b.index)
         df_b['总成本'] = qty_series * df_b['成本'] * rate_rmb_to_fx
         df_b.loc[df_b['is_sd'] == True, '总成本'] = 0.0
         if b_status:
@@ -196,38 +195,39 @@ if all([file_a, file_b, file_c, file_d]):
         df_b['毛利'] = df_b['实际售价'] + df_b['Total Fees'] - df_b['总成本'] - df_b['广告'] - df_b['刷单'] - df_b['刷单佣金']
 
         # ==========================================
-        # 🟢 终极强制映射：账单明细(表A) 组装
+        # 🟢 终极强制映射：携带双层表头组装表A
         # ==========================================
-        template_columns = df_a_raw.columns.tolist()
-        df_final = pd.DataFrame(columns=template_columns)
+        # 创建一个空表，完全继承原表 A 的列数和双排表头结构
+        df_final = pd.DataFrame(index=df_b.index, columns=df_a_raw.columns)
 
-        # 辅助函数：通过正则表达式直接定位模板里的列
-        def get_t_col(keywords):
-            for col in template_columns:
-                if pd.isna(col): continue
-                s = str(col).strip().lower().replace('\n', ' ')
+        def get_t_col_tuple(keywords):
+            for col in df_final.columns:
+                # 把第一行中文和第二行英文合并起来，无论搜什么语言的词都能找到这列
+                search_text = " ".join([str(x) for x in col if pd.notna(x)]).lower().replace('\n', ' ')
                 for k in keywords:
-                    if re.search(k, s, re.IGNORECASE): return col
+                    if re.search(k, search_text, re.IGNORECASE):
+                        return col
             return None
 
-        # 强制塞入数据 (只要表 B 存在对应列，就毫不留情地赋值过去)
+        # 暴力赋值器：只要找到了对应列，直接把 B 表算好的数据覆盖过去
         def assign_to_final(df_col_name, keywords):
-            t_col = get_t_col(keywords)
+            t_col = get_t_col_tuple(keywords)
             if t_col and df_col_name in df_b.columns:
                 df_final[t_col] = df_b[df_col_name]
 
-        if b_order: assign_to_final(b_order, [r'^order number$', r'^order id$'])
-        if b_status: assign_to_final(b_status, [r'order status', r'status'])
+        # 映射基础销售字段
+        if b_order_col: assign_to_final(b_order_col, [r'^order number$', r'^order id$', r'订单号'])
+        if b_status: assign_to_final(b_status, [r'order status', r'status', r'订单状态'])
         if b_sku: assign_to_final(b_sku, [r'seller sku', r'sku'])
         if b_qty: assign_to_final(b_qty, [r'^quantity$', r'数量', r'count'])
-        if b_return: assign_to_final(b_return, [r'quantity of return', r'退货'])
+        if b_return: assign_to_final(b_return, [r'quantity of return', r'退货', r'取消数量'])
         if b_plat_disc: assign_to_final(b_plat_disc, [r'platform discount', r'平台折扣'])
         if b_sell_disc: assign_to_final(b_sell_disc, [r'seller discount', r'买家折扣', r'卖家折扣'])
-        if b_sub_after: assign_to_final(b_sub_after, [r'subtotal after discount'])
+        if b_sub_after: assign_to_final(b_sub_after, [r'subtotal after discount', r'售价'])
 
-        # 强制塞入计算出来的数据
+        # 映射核算出来的业务字段
         assign_to_final('订单统计', [r'订单统计', r'计数'])
-        assign_to_final('实际售价', [r'实际售价', r'售价'])
+        assign_to_final('实际售价', [r'实际售价', r'销售计算'])
         assign_to_final('佣金共计', [r'佣金共计', r'佣金总计'])
         assign_to_final('成本', [r'^成本$'])
         assign_to_final('总成本', [r'^总成本$'])
@@ -236,11 +236,12 @@ if all([file_a, file_b, file_c, file_d]):
         assign_to_final('刷单佣金', [r'^刷单佣金$'])
         assign_to_final('毛利', [r'^毛利$'])
 
+        # 映射 36 项明细费项
         for fee in all_fee_columns:
-            assign_to_final(fee, [r'^' + re.escape(fee.lower()) + r'$', re.escape(fee.lower())])
+            assign_to_final(fee, [r'(?i)' + re.escape(fee)])
 
         # ==========================================
-        # 🟢 模块 1-3：全局统计表生成
+        # 🟢 全局统计表生成
         # ==========================================
         total_qty = qty_series.sum() if isinstance(qty_series, pd.Series) else 0
         total_sales = df_b['实际售价'].sum()
@@ -298,7 +299,7 @@ if all([file_a, file_b, file_c, file_d]):
         # 打包导出
         # ==========================================
         st.divider()
-        st.success("✅ 强制赋值机制生效！再刁钻的隐藏字符也拦不住数据对齐。")
+        st.success("✅ 数据合并大成功！导出的 Excel 将完美保留原有的双层表头结构。")
         st.dataframe(df_final.head(15))
 
         output = io.BytesIO()
@@ -308,7 +309,7 @@ if all([file_a, file_b, file_c, file_d]):
             if not df_sku.empty: df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
             if not df_shipping.empty: df_shipping.to_excel(writer, sheet_name='物流费分析', index=False)
             
-        st.download_button(label="📥 下载多维数据报表", data=output.getvalue(), file_name="TK_Dashboard_Report.xlsx")
+        st.download_button(label="📥 下载带有双层表头的多维数据报表", data=output.getvalue(), file_name="TK_Dashboard_Report_V2.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行发生异常: {e}")
