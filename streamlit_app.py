@@ -35,15 +35,10 @@ with col3: file_c = st.file_uploader("表 C (收入表)", type=["xlsx", "csv"])
 with col4: file_d = st.file_uploader("表 D (成本表)", type=["xlsx", "csv"])
 with col5: file_e = st.file_uploader("表 E (刷单表 - 可选)", type=["xlsx", "csv"])
 
-# 辅助函数：暴力清洗表头中的换行符、双空格
-def to_key(s):
-    if pd.isna(s): return ""
-    return re.sub(r'\s+', ' ', str(s)).strip().lower()
-
-# 辅助函数：正则匹配列名
+# 辅助函数：正则匹配列名 (免疫换行和空格)
 def find_col_regex(df_cols, pattern):
     for c in df_cols:
-        if pd.notna(c) and re.search(pattern, str(c), re.IGNORECASE):
+        if pd.notna(c) and re.search(pattern, str(c).replace('\n', ' '), re.IGNORECASE):
             return c
     return None
 
@@ -81,7 +76,7 @@ if all([file_a, file_b, file_c, file_d]):
         b_order_col = find_col_regex(df_b.columns, r'order id|order number')
         c_order_col = find_col_regex(df_c.columns, r'adjustment id|order id|order number')
         
-        # 【关键修复】删除 TikTok 导出的第一行解释文本，防止它变成 0
+        # 删除 TikTok 导出的第一行解释文本
         if b_order_col:
             df_b = df_b[~df_b[b_order_col].astype(str).str.contains(r'Platform unique|Transaction|Order', flags=re.IGNORECASE, na=False)].reset_index(drop=True)
         if c_order_col:
@@ -90,42 +85,30 @@ if all([file_a, file_b, file_c, file_d]):
         df_b['match_id'] = df_b[b_order_col].apply(clean_id)
         df_c['match_id'] = df_c[c_order_col].apply(clean_id)
         
-        # 【关键修复】采用正则模糊搜索，彻底免疫隐藏换行符
-        b_cols_needed = {
-            'order status': r'order status|status',
-            'Seller sku': r'seller sku|sku id',
-            'Quantity': r'^quantity$|sold quantity|qty',
-            'Sku Quantity of return': r'quantity of return|return quantity|return qty',
-            'SKU Platform Discount': r'platform discount',
-            'SKU Seller Discount': r'seller discount',
-            'SKU Subtotal After Discount': r'subtotal after discount'
-        }
-        
-        df = pd.DataFrame()
-        df['order number'] = df_b[b_order_col] 
-        df['match_id'] = df_b['match_id']
-        
-        # 提取表B的对应列到工作表 df 中
-        for tgt_col, pattern in b_cols_needed.items():
-            actual_col = find_col_regex(df_b.columns, pattern)
-            df[tgt_col] = df_b[actual_col] if actual_col else 0
+        # 锁定表 B 的各种字段
+        b_status = find_col_regex(df_b.columns, r'order status|status')
+        b_sku = find_col_regex(df_b.columns, r'seller sku|sku id')
+        b_qty = find_col_regex(df_b.columns, r'^quantity$|sold quantity|qty')
+        b_return = find_col_regex(df_b.columns, r'quantity of return|return quantity|return qty')
+        b_plat_disc = find_col_regex(df_b.columns, r'platform discount')
+        b_sell_disc = find_col_regex(df_b.columns, r'seller discount')
+        b_sub_after = find_col_regex(df_b.columns, r'subtotal after discount')
 
         # ==========================================
         # 第二步：计算“订单统计”与“实际售价”
         # ==========================================
-        df['订单统计'] = df.groupby('match_id')['match_id'].transform('count')
+        df_b['订单统计'] = df_b.groupby('match_id')['match_id'].transform('count')
         
-        v_plat = pd.to_numeric(df['SKU Platform Discount'], errors='coerce').fillna(0)
-        v_sub_after = pd.to_numeric(df['SKU Subtotal After Discount'], errors='coerce').fillna(0)
+        v_plat = pd.to_numeric(df_b[b_plat_disc], errors='coerce').fillna(0) if b_plat_disc else 0
+        v_sub_after = pd.to_numeric(df_b[b_sub_after], errors='coerce').fillna(0) if b_sub_after else 0
         
-        df['实际售价'] = v_plat + v_sub_after
-        df.loc[df['order status'].astype(str).str.lower() == 'canceled', '实际售价'] = 0.0
+        df_b['实际售价'] = v_plat + v_sub_after
+        if b_status:
+            df_b.loc[df_b[b_status].astype(str).str.lower() == 'canceled', '实际售价'] = 0.0
 
         # ==========================================
         # 第三步：匹配表 C 费用
         # ==========================================
-        c_col_map = {to_key(c): c for c in df_c.columns}
-        
         all_fee_columns = [
             'Total Fees', 'Platform commission fee', 'Pre-order service fee', 'Mall service fee', 'Payment Fee', 
             'Shipping cost', 'Shipping costs passed on to the logistics provider', 'Replacement shipping fee (passed on to the customer)', 
@@ -139,22 +122,25 @@ if all([file_a, file_b, file_c, file_d]):
             'GMV Max ad fee', 'Ajustment amount'
         ]
         
-        valid_c_cols = [c_col_map[to_key(f)] for f in all_fee_columns if to_key(f) in c_col_map]
+        # 寻找表C中对应的列名
+        fee_cols_in_c = {}
+        for fee in all_fee_columns:
+            c_col = find_col_regex(df_c.columns, r'^' + re.escape(fee) + r'$|' + re.escape(fee))
+            if c_col: fee_cols_in_c[fee] = c_col
+
         df_c_unique = df_c.drop_duplicates(subset=['match_id'])
-        df = pd.merge(df, df_c_unique[['match_id'] + valid_c_cols], on='match_id', how='left')
+        df_b = pd.merge(df_b, df_c_unique[['match_id'] + list(fee_cols_in_c.values())], on='match_id', how='left')
         
         佣金求和项 = []
         for fee in all_fee_columns:
-            actual_c_col = c_col_map.get(to_key(fee))
-            if actual_c_col:
-                df[fee] = pd.to_numeric(df[actual_c_col], errors='coerce').fillna(0) / df['订单统计']
-                if to_key(fee) != 'total fees':
-                    佣金求和项.append(fee)
+            if fee in fee_cols_in_c:
+                c_col = fee_cols_in_c[fee]
+                df_b[fee] = pd.to_numeric(df_b[c_col], errors='coerce').fillna(0) / df_b['订单统计']
+                if fee.lower() != 'total fees': 佣金求和项.append(fee)
             else:
-                df[fee] = 0.0
+                df_b[fee] = 0.0
                 
-        df['佣金共计'] = df[佣金求和项].sum(axis=1)
-        df['佣金总计'] = df['佣金共计']
+        df_b['佣金共计'] = df_b[佣金求和项].sum(axis=1)
 
         # ==========================================
         # 第五步：匹配成本表
@@ -162,71 +148,107 @@ if all([file_a, file_b, file_c, file_d]):
         d_sku_actual = find_col_regex(df_d.columns, r'nomor referensi sku|seller sku')
         d_cost_actual = find_col_regex(df_d.columns, r'成本|cost|价格')
         
-        if d_sku_actual and d_cost_actual:
+        if d_sku_actual and d_cost_actual and b_sku:
             df_d['match_sku'] = df_d[d_sku_actual].astype(str).str.strip().str.lower()
-            df['match_sku'] = df['Seller sku'].astype(str).str.strip().str.lower()
-            
+            df_b['match_sku'] = df_b[b_sku].astype(str).str.strip().str.lower()
             df_d_unique = df_d.drop_duplicates(subset=['match_sku'])
-            df = pd.merge(df, df_d_unique[['match_sku', d_cost_actual]], on='match_sku', how='left')
-            df['成本'] = pd.to_numeric(df[d_cost_actual], errors='coerce').fillna(0)
+            df_b = pd.merge(df_b, df_d_unique[['match_sku', d_cost_actual]], on='match_sku', how='left')
+            df_b['成本'] = pd.to_numeric(df_b[d_cost_actual], errors='coerce').fillna(0)
         else:
-            df['成本'] = 0.0
+            df_b['成本'] = 0.0
 
         # ==========================================
         # 第六步：匹配表 E 刷单表
         # ==========================================
-        df['刷单'] = 0.0
-        df['刷单佣金'] = 0.0
-        df['is_sd'] = False
-        
+        df_b['刷单'] = 0.0
+        df_b['刷单佣金'] = 0.0
+        df_b['is_sd'] = False
         if file_e:
             df_e = pd.read_excel(file_e) if file_e.name.endswith('xlsx') else pd.read_csv(file_e)
             e_order_actual = find_col_regex(df_e.columns, r'order id|order number|单号')
             e_fee_actual = find_col_regex(df_e.columns, r'fee|刷单|费用')
-            
             if e_order_actual and e_fee_actual:
                 df_e['match_id'] = df_e[e_order_actual].apply(clean_id)
                 df_e_unique = df_e.drop_duplicates(subset=['match_id'])
-                df = pd.merge(df, df_e_unique[['match_id', e_fee_actual]], on='match_id', how='left')
-                
-                df['is_sd'] = df[e_fee_actual].notnull()
-                df['刷单'] = pd.to_numeric(df[e_fee_actual], errors='coerce').fillna(0) * rate_rmb_to_fx
-                df['刷单佣金'] = df['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
+                df_b = pd.merge(df_b, df_e_unique[['match_id', e_fee_actual]], on='match_id', how='left')
+                df_b['is_sd'] = df_b[e_fee_actual].notnull()
+                df_b['刷单'] = pd.to_numeric(df_b[e_fee_actual], errors='coerce').fillna(0) * rate_rmb_to_fx
+                df_b['刷单佣金'] = df_b['is_sd'].apply(lambda x: 12.0 * rate_rmb_to_fx if x else 0.0)
 
         # ==========================================
         # 第七步：计算总成本
         # ==========================================
-        df['Quantity_num'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
-        df['总成本'] = df['Quantity_num'] * df['成本'] * rate_rmb_to_fx
-        
-        df.loc[df['is_sd'] == True, '总成本'] = 0.0
-        df.loc[df['order status'].astype(str).str.lower() == 'canceled', '总成本'] = 0.0
+        qty_series = pd.to_numeric(df_b[b_qty], errors='coerce').fillna(0) if b_qty else 0
+        df_b['总成本'] = qty_series * df_b['成本'] * rate_rmb_to_fx
+        df_b.loc[df_b['is_sd'] == True, '总成本'] = 0.0
+        if b_status:
+            df_b.loc[df_b[b_status].astype(str).str.lower() == 'canceled', '总成本'] = 0.0
 
         # ==========================================
         # 第八步 & 第九步：广告与毛利
         # ==========================================
-        valid_sales_mask = df['order status'].astype(str).str.lower() != 'canceled'
-        total_valid_sales = df.loc[valid_sales_mask, '实际售价'].sum()
-        
-        df['广告'] = 0.0
+        valid_sales_mask = df_b[b_status].astype(str).str.lower() != 'canceled' if b_status else pd.Series(True, index=df_b.index)
+        total_valid_sales = df_b.loc[valid_sales_mask, '实际售价'].sum()
+        df_b['广告'] = 0.0
         if total_valid_sales > 0:
-            df.loc[valid_sales_mask, '广告'] = (df.loc[valid_sales_mask, '实际售价'] / total_valid_sales) * total_ads_fx
+            df_b.loc[valid_sales_mask, '广告'] = (df_b.loc[valid_sales_mask, '实际售价'] / total_valid_sales) * total_ads_fx
 
-        t_fee_col = 'Total Fees'
-        t_fee_val = df[t_fee_col] if t_fee_col in df.columns else 0.0
-        df['毛利'] = df['实际售价'] + t_fee_val - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
+        df_b['毛利'] = df_b['实际售价'] + df_b['Total Fees'] - df_b['总成本'] - df_b['广告'] - df_b['刷单'] - df_b['刷单佣金']
 
         # ==========================================
-        # 🟢 新增模块 1-3：全局统计表生成
+        # 🟢 终极强制映射：账单明细(表A) 组装
         # ==========================================
-        total_qty = df['Quantity_num'].sum()
-        total_sales = df['实际售价'].sum()
-        total_ads = df['广告'].sum()
-        total_cost = df['总成本'].sum()
-        total_profit = df['毛利'].sum()
+        template_columns = df_a_raw.columns.tolist()
+        df_final = pd.DataFrame(columns=template_columns)
 
-        def pct(val, base):
-            return f"{(val/base)*100:.2f}%" if base > 0 else "0.00%"
+        # 辅助函数：通过正则表达式直接定位模板里的列
+        def get_t_col(keywords):
+            for col in template_columns:
+                if pd.isna(col): continue
+                s = str(col).strip().lower().replace('\n', ' ')
+                for k in keywords:
+                    if re.search(k, s, re.IGNORECASE): return col
+            return None
+
+        # 强制塞入数据 (只要表 B 存在对应列，就毫不留情地赋值过去)
+        def assign_to_final(df_col_name, keywords):
+            t_col = get_t_col(keywords)
+            if t_col and df_col_name in df_b.columns:
+                df_final[t_col] = df_b[df_col_name]
+
+        if b_order: assign_to_final(b_order, [r'^order number$', r'^order id$'])
+        if b_status: assign_to_final(b_status, [r'order status', r'status'])
+        if b_sku: assign_to_final(b_sku, [r'seller sku', r'sku'])
+        if b_qty: assign_to_final(b_qty, [r'^quantity$', r'数量', r'count'])
+        if b_return: assign_to_final(b_return, [r'quantity of return', r'退货'])
+        if b_plat_disc: assign_to_final(b_plat_disc, [r'platform discount', r'平台折扣'])
+        if b_sell_disc: assign_to_final(b_sell_disc, [r'seller discount', r'买家折扣', r'卖家折扣'])
+        if b_sub_after: assign_to_final(b_sub_after, [r'subtotal after discount'])
+
+        # 强制塞入计算出来的数据
+        assign_to_final('订单统计', [r'订单统计', r'计数'])
+        assign_to_final('实际售价', [r'实际售价', r'售价'])
+        assign_to_final('佣金共计', [r'佣金共计', r'佣金总计'])
+        assign_to_final('成本', [r'^成本$'])
+        assign_to_final('总成本', [r'^总成本$'])
+        assign_to_final('广告', [r'^广告$'])
+        assign_to_final('刷单', [r'^刷单$', r'刷单费用'])
+        assign_to_final('刷单佣金', [r'^刷单佣金$'])
+        assign_to_final('毛利', [r'^毛利$'])
+
+        for fee in all_fee_columns:
+            assign_to_final(fee, [r'^' + re.escape(fee.lower()) + r'$', re.escape(fee.lower())])
+
+        # ==========================================
+        # 🟢 模块 1-3：全局统计表生成
+        # ==========================================
+        total_qty = qty_series.sum() if isinstance(qty_series, pd.Series) else 0
+        total_sales = df_b['实际售价'].sum()
+        total_ads = df_b['广告'].sum()
+        total_cost = df_b['总成本'].sum()
+        total_profit = df_b['毛利'].sum()
+
+        def pct(val, base): return f"{(val/base)*100:.2f}%" if base > 0 else "0.00%"
 
         summary_data = [
             {'分析指标': '销售总额 (Actual Sales)', '金额/数值': total_sales, '占销售额百分比': '-'},
@@ -237,15 +259,12 @@ if all([file_a, file_b, file_c, file_d]):
         ]
         
         for fee in all_fee_columns:
-            if fee in df.columns:
-                fee_sum = df[fee].sum()
+            if fee in df_b.columns:
+                fee_sum = df_b[fee].sum()
                 if fee_sum != 0:
-                    summary_data.append({
-                        '分析指标': f"【费项】{fee}", '金额/数值': fee_sum, '占销售额百分比': pct(fee_sum, total_sales)
-                    })
+                    summary_data.append({'分析指标': f"【费项】{fee}", '金额/数值': fee_sum, '占销售额百分比': pct(fee_sum, total_sales)})
         df_summary = pd.DataFrame(summary_data)
 
-        # 物流分析
         shipping_cols = [
             'Payment Fee', 'Shipping cost', 'Shipping costs passed on to the logistics provider', 
             'Replacement shipping fee (passed on to the customer)', 'Exchange shipping fee (passed on to the customer)', 
@@ -253,50 +272,43 @@ if all([file_a, file_b, file_c, file_d]):
             'Refunded shipping cost paid by the customer', 'Return shipping costs (passed on to the customer)', 
             'Shipping cost subsidy', 'Distance shipping fee from Horizon+ Program'
         ]
-        valid_ship_cols = [c for c in shipping_cols if c in df.columns]
-        df_shipping = df.groupby('Seller sku')[valid_ship_cols].sum().reset_index()
-        df_shipping['物流相关费用总计'] = df_shipping[valid_ship_cols].sum(axis=1)
-        df_shipping = df_shipping.sort_values(by='物流相关费用总计', ascending=True)
+        valid_ship_cols = [c for c in shipping_cols if c in df_b.columns]
+        
+        if b_sku and b_sku in df_b.columns:
+            df_shipping = df_b.groupby(b_sku)[valid_ship_cols].sum().reset_index()
+            df_shipping.rename(columns={b_sku: 'Seller sku'}, inplace=True)
+            df_shipping['物流相关费用总计'] = df_shipping[valid_ship_cols].sum(axis=1)
+            df_shipping = df_shipping.sort_values(by='物流相关费用总计', ascending=True)
 
-        # SKU分析
-        df_sku = df.groupby('Seller sku').agg(
-            销量=('Quantity_num', 'sum'),销售额=('实际售价', 'sum'),广告花费=('广告', 'sum'),
-            总成本=('总成本', 'sum'),毛利=('毛利', 'sum')
-        ).reset_index()
-        df_sku['成本占比'] = df_sku.apply(lambda x: f"{(x['总成本']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
-        df_sku['广告占比'] = df_sku.apply(lambda x: f"{(x['广告花费']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
-        df_sku['毛利率'] = df_sku.apply(lambda x: f"{(x['毛利']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
-        df_sku = df_sku.sort_values(by='销售额', ascending=False)
+            df_sku = df_b.groupby(b_sku).agg(
+                销量=(b_qty if b_qty else 'Quantity', 'sum'),
+                销售额=('实际售价', 'sum'),广告花费=('广告', 'sum'),
+                总成本=('总成本', 'sum'),毛利=('毛利', 'sum')
+            ).reset_index()
+            df_sku.rename(columns={b_sku: 'Seller sku'}, inplace=True)
+            df_sku['成本占比'] = df_sku.apply(lambda x: f"{(x['总成本']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+            df_sku['广告占比'] = df_sku.apply(lambda x: f"{(x['广告花费']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+            df_sku['毛利率'] = df_sku.apply(lambda x: f"{(x['毛利']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
+            df_sku = df_sku.sort_values(by='销售额', ascending=False)
+        else:
+            df_shipping = pd.DataFrame()
+            df_sku = pd.DataFrame()
 
         # ==========================================
-        # 🟢 模块 4：账单明细(表A) 组装
+        # 打包导出
         # ==========================================
-        template_columns = df_a_raw.columns.tolist()
-        df_final = pd.DataFrame(columns=template_columns)
-        
-        # 将所有的空格、换行符全部归一化，绝对保障列名精准对接！
-        df_cols_map = {to_key(c): c for c in df.columns}
-        
-        for t_col in template_columns:
-            if pd.isna(t_col): continue
-            
-            # 使用超级归一化来匹配新模板的名字
-            match_col = df_cols_map.get(to_key(t_col))
-            if match_col:
-                df_final[t_col] = df[match_col]
-
         st.divider()
-        st.success("✅ 销售表核心字段匹配成功！数据已全部对齐。")
+        st.success("✅ 强制赋值机制生效！再刁钻的隐藏字符也拦不住数据对齐。")
         st.dataframe(df_final.head(15))
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, sheet_name='账单明细(表A)', index=False)
             df_summary.to_excel(writer, sheet_name='店铺汇总', index=False)
-            df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
-            df_shipping.to_excel(writer, sheet_name='物流费分析', index=False)
+            if not df_sku.empty: df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
+            if not df_shipping.empty: df_shipping.to_excel(writer, sheet_name='物流费分析', index=False)
             
-        st.download_button(label="📥 下载多维数据报表 (包含 4 个 Sheet)", data=output.getvalue(), file_name="TK_Dashboard_Report.xlsx")
+        st.download_button(label="📥 下载多维数据报表", data=output.getvalue(), file_name="TK_Dashboard_Report.xlsx")
 
     except Exception as e:
         st.error(f"❌ 运行发生异常: {e}")
