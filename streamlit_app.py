@@ -35,12 +35,21 @@ with col3: file_c = st.file_uploader("表 C (收入表)", type=["xlsx", "csv"])
 with col4: file_d = st.file_uploader("表 D (成本表)", type=["xlsx", "csv"])
 with col5: file_e = st.file_uploader("表 E (刷单表 - 可选)", type=["xlsx", "csv"])
 
-# 辅助函数：安全转小写
+# 辅助函数：暴力清洗表头中的换行符、双空格
 def to_key(s):
-    return str(s).strip().lower()
+    if pd.isna(s): return ""
+    return re.sub(r'\s+', ' ', str(s)).strip().lower()
+
+# 辅助函数：正则匹配列名
+def find_col_regex(df_cols, pattern):
+    for c in df_cols:
+        if pd.notna(c) and re.search(pattern, str(c), re.IGNORECASE):
+            return c
+    return None
 
 # 辅助函数：终极单号清洗器
 def clean_id(x):
+    if pd.isna(x): return ""
     s = str(x).strip().lower()
     if 'e+' in s:
         try:
@@ -54,7 +63,7 @@ def clean_id(x):
 if all([file_a, file_b, file_c, file_d]):
     try:
         # ==========================================
-        # 第一步：精准读取
+        # 第一步：精准读取与清洗
         # ==========================================
         df_a_raw = pd.read_excel(file_a, header=1) if file_a.name.endswith('xlsx') else pd.read_csv(file_a, header=1)
         df_b = pd.read_excel(file_b, header=0) if file_b.name.endswith('xlsx') else pd.read_csv(file_b, header=0)
@@ -69,23 +78,37 @@ if all([file_a, file_b, file_c, file_d]):
         df_d = pd.read_excel(file_d) if file_d.name.endswith('xlsx') else pd.read_csv(file_d)
 
         # 获取核心列名
-        b_order_col = next((c for c in df_b.columns if 'order id' in to_key(c) or 'order number' in to_key(c)), None)
-        c_order_col = next((c for c in df_c.columns if 'adjustment id' in to_key(c) or 'order id' in to_key(c)), None)
+        b_order_col = find_col_regex(df_b.columns, r'order id|order number')
+        c_order_col = find_col_regex(df_c.columns, r'adjustment id|order id|order number')
         
+        # 【关键修复】删除 TikTok 导出的第一行解释文本，防止它变成 0
+        if b_order_col:
+            df_b = df_b[~df_b[b_order_col].astype(str).str.contains(r'Platform unique|Transaction|Order', flags=re.IGNORECASE, na=False)].reset_index(drop=True)
+        if c_order_col:
+            df_c = df_c[~df_c[c_order_col].astype(str).str.contains(r'Platform unique|Transaction|Order', flags=re.IGNORECASE, na=False)].reset_index(drop=True)
+
         df_b['match_id'] = df_b[b_order_col].apply(clean_id)
         df_c['match_id'] = df_c[c_order_col].apply(clean_id)
         
-        b_cols_needed = ['order status', 'Seller sku', 'Quantity', 'Sku Quantity of return', 
-                         'SKU Platform Discount', 'SKU Seller Discount', 'SKU Subtotal After Discount']
-        b_col_map = {to_key(c): c for c in df_b.columns}
+        # 【关键修复】采用正则模糊搜索，彻底免疫隐藏换行符
+        b_cols_needed = {
+            'order status': r'order status|status',
+            'Seller sku': r'seller sku|sku id',
+            'Quantity': r'^quantity$|sold quantity|qty',
+            'Sku Quantity of return': r'quantity of return|return quantity|return qty',
+            'SKU Platform Discount': r'platform discount',
+            'SKU Seller Discount': r'seller discount',
+            'SKU Subtotal After Discount': r'subtotal after discount'
+        }
         
         df = pd.DataFrame()
         df['order number'] = df_b[b_order_col] 
         df['match_id'] = df_b['match_id']
         
-        for col in b_cols_needed:
-            actual_col = b_col_map.get(to_key(col))
-            df[col] = df_b[actual_col] if actual_col else 0
+        # 提取表B的对应列到工作表 df 中
+        for tgt_col, pattern in b_cols_needed.items():
+            actual_col = find_col_regex(df_b.columns, pattern)
+            df[tgt_col] = df_b[actual_col] if actual_col else 0
 
         # ==========================================
         # 第二步：计算“订单统计”与“实际售价”
@@ -136,8 +159,8 @@ if all([file_a, file_b, file_c, file_d]):
         # ==========================================
         # 第五步：匹配成本表
         # ==========================================
-        d_sku_actual = next((c for c in df_d.columns if 'nomor referensi sku' in to_key(c) or 'seller sku' in to_key(c)), None)
-        d_cost_actual = next((c for c in df_d.columns if '成本' in to_key(c) or 'cost' in to_key(c) or '价格' in to_key(c)), None)
+        d_sku_actual = find_col_regex(df_d.columns, r'nomor referensi sku|seller sku')
+        d_cost_actual = find_col_regex(df_d.columns, r'成本|cost|价格')
         
         if d_sku_actual and d_cost_actual:
             df_d['match_sku'] = df_d[d_sku_actual].astype(str).str.strip().str.lower()
@@ -158,9 +181,8 @@ if all([file_a, file_b, file_c, file_d]):
         
         if file_e:
             df_e = pd.read_excel(file_e) if file_e.name.endswith('xlsx') else pd.read_csv(file_e)
-            e_col_map = {to_key(c): c for c in df_e.columns}
-            e_order_actual = e_col_map.get('order id') or e_col_map.get('order number')
-            e_fee_actual = next((c for c in df_e.columns if 'fee' in to_key(c) or '刷单' in to_key(c) or '费用' in to_key(c)), None)
+            e_order_actual = find_col_regex(df_e.columns, r'order id|order number|单号')
+            e_fee_actual = find_col_regex(df_e.columns, r'fee|刷单|费用')
             
             if e_order_actual and e_fee_actual:
                 df_e['match_id'] = df_e[e_order_actual].apply(clean_id)
@@ -195,7 +217,7 @@ if all([file_a, file_b, file_c, file_d]):
         df['毛利'] = df['实际售价'] + t_fee_val - df['总成本'] - df['广告'] - df['刷单'] - df['刷单佣金']
 
         # ==========================================
-        # 🟢 新增模块 1：构建 Sheet (店铺汇总)
+        # 🟢 新增模块 1-3：全局统计表生成
         # ==========================================
         total_qty = df['Quantity_num'].sum()
         total_sales = df['实际售价'].sum()
@@ -214,22 +236,16 @@ if all([file_a, file_b, file_c, file_d]):
             {'分析指标': '毛利总额 (Gross Profit)', '金额/数值': total_profit, '占销售额百分比': pct(total_profit, total_sales)},
         ]
         
-        # 将各佣金项自动追加进汇总表
         for fee in all_fee_columns:
             if fee in df.columns:
                 fee_sum = df[fee].sum()
                 if fee_sum != 0:
                     summary_data.append({
-                        '分析指标': f"【费项】{fee}",
-                        '金额/数值': fee_sum,
-                        '占销售额百分比': pct(fee_sum, total_sales)
+                        '分析指标': f"【费项】{fee}", '金额/数值': fee_sum, '占销售额百分比': pct(fee_sum, total_sales)
                     })
-        
         df_summary = pd.DataFrame(summary_data)
 
-        # ==========================================
-        # 🟢 新增模块 2：构建 Sheet (物流运费分析)
-        # ==========================================
+        # 物流分析
         shipping_cols = [
             'Payment Fee', 'Shipping cost', 'Shipping costs passed on to the logistics provider', 
             'Replacement shipping fee (passed on to the customer)', 'Exchange shipping fee (passed on to the customer)', 
@@ -238,54 +254,43 @@ if all([file_a, file_b, file_c, file_d]):
             'Shipping cost subsidy', 'Distance shipping fee from Horizon+ Program'
         ]
         valid_ship_cols = [c for c in shipping_cols if c in df.columns]
-        
         df_shipping = df.groupby('Seller sku')[valid_ship_cols].sum().reset_index()
         df_shipping['物流相关费用总计'] = df_shipping[valid_ship_cols].sum(axis=1)
-        
-        # 按费用总计倒序排列
         df_shipping = df_shipping.sort_values(by='物流相关费用总计', ascending=True)
 
-        # ==========================================
-        # 🟢 新增模块 3：构建 Sheet (SKU 深度分析)
-        # ==========================================
+        # SKU分析
         df_sku = df.groupby('Seller sku').agg(
-            销量=('Quantity_num', 'sum'),
-            销售额=('实际售价', 'sum'),
-            广告花费=('广告', 'sum'),
-            总成本=('总成本', 'sum'),
-            毛利=('毛利', 'sum')
+            销量=('Quantity_num', 'sum'),销售额=('实际售价', 'sum'),广告花费=('广告', 'sum'),
+            总成本=('总成本', 'sum'),毛利=('毛利', 'sum')
         ).reset_index()
-
         df_sku['成本占比'] = df_sku.apply(lambda x: f"{(x['总成本']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
         df_sku['广告占比'] = df_sku.apply(lambda x: f"{(x['广告花费']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
         df_sku['毛利率'] = df_sku.apply(lambda x: f"{(x['毛利']/x['销售额'])*100:.2f}%" if x['销售额']>0 else "0.00%", axis=1)
-        
-        # 按照销售额从大到小排序
         df_sku = df_sku.sort_values(by='销售额', ascending=False)
 
         # ==========================================
-        # 构建 Sheet (原有的模板明细表)
+        # 🟢 模块 4：账单明细(表A) 组装
         # ==========================================
         template_columns = df_a_raw.columns.tolist()
         df_final = pd.DataFrame(columns=template_columns)
+        
+        # 将所有的空格、换行符全部归一化，绝对保障列名精准对接！
         df_cols_map = {to_key(c): c for c in df.columns}
+        
         for t_col in template_columns:
             if pd.isna(t_col): continue
-            clean_t_col = str(t_col).replace('\n', ' ').strip().lower()
-            match_col = next((c for c in df.columns if str(c).replace('\n', ' ').strip().lower() == clean_t_col), None)
+            
+            # 使用超级归一化来匹配新模板的名字
+            match_col = df_cols_map.get(to_key(t_col))
             if match_col:
                 df_final[t_col] = df[match_col]
 
-        # ==========================================
-        # 【修改点】打包导出多 Sheet Excel (调整生成顺序)
-        # ==========================================
         st.divider()
-        st.success("✅ 核算完毕！已成功生成包含四大分析维度的数据报表。")
-        st.dataframe(df_final.head(15)) # 网页展示也改回默认显示账单明细
+        st.success("✅ 销售表核心字段匹配成功！数据已全部对齐。")
+        st.dataframe(df_final.head(15))
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            # 写入四大工作表 (严格按照你要求的顺序)
             df_final.to_excel(writer, sheet_name='账单明细(表A)', index=False)
             df_summary.to_excel(writer, sheet_name='店铺汇总', index=False)
             df_sku.to_excel(writer, sheet_name='SKU分析', index=False)
